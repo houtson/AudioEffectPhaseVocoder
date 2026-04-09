@@ -39,32 +39,30 @@ extern "C" {
     extern const float coefB_512_f32[];
 }
 
-#define FFT_SIZE    1024
-#define OVER_SAMPLE 8
-#define HALF_FFT_SIZE FFT_SIZE / 2
+#define FFT_SIZE      1024
+#define OVER_SAMPLE   8
+#define HALF_FFT_SIZE (FFT_SIZE / 2)
 
 class AudioEffectPhaseVocoder : public AudioStream {
 public:
     AudioEffectPhaseVocoder() : AudioStream(1, inputQueueArray),
-                           pshift(0),
                            state(0)
     {
         memset(Last_Phase,  0, FFT_SIZE * sizeof(float));
         memset(Phase_Sum,   0, FFT_SIZE * sizeof(float));
-        memset(Synth_Accum, 0, (FFT_SIZE+AUDIO_BLOCK_SAMPLES) * sizeof(float));
+        memset(Synth_Accum, 0, (FFT_SIZE + AUDIO_BLOCK_SAMPLES) * sizeof(float));
         instance2 = &arm_cfft_sR_f32_len1024;
         instance  = &arm_cfft_sR_f32_len512;
         window = win1024_f32;
-        coefA = coefA_512_f32;
-        coefB = coefB_512_f32;
+        coefA  = coefA_512_f32;
+        coefB  = coefB_512_f32;
     }
 
-    float setPitchShift(float semitones) {
-        pshift = powf(2.0f, semitones / 12.0f);
-        return pshift;
-    }
+    // Stub — pitch shifting is not yet implemented
+    void setPitchShift(float semitones) { (void)semitones; }
 
     virtual void update(void);
+
 private:
     const float *window;
     const float *coefA;
@@ -72,18 +70,19 @@ private:
     audio_block_t outblock;
     const arm_cfft_instance_f32 *instance;
     const arm_cfft_instance_f32 *instance2;
-    float pshift;
     uint8_t state;
+
+    // Derived constants — update these when hop sizes change for time-stretching
     const long  STEP_SIZE    = FFT_SIZE / OVER_SAMPLE;
     const float FREQ_PER_BIN = AUDIO_SAMPLE_RATE_EXACT / (float)FFT_SIZE;
-    const float EXPECT       = 2.0f * M_PI * (float)STEP_SIZE / (float)FFT_SIZE;
-    float Max_Magns             [10];
+    const float EXPECT       = 2.0f * M_PI * (float)(FFT_SIZE / OVER_SAMPLE) / (float)FFT_SIZE;
+
     float Phase_Sum             [FFT_SIZE];
     float FFT_Frame             [FFT_SIZE];
     float Last_Phase            [FFT_SIZE];
     float Synth_Freq            [FFT_SIZE];
     float Synth_Magn            [FFT_SIZE];
-    float Synth_Accum           [FFT_SIZE+AUDIO_BLOCK_SAMPLES];
+    float Synth_Accum           [FFT_SIZE + AUDIO_BLOCK_SAMPLES];
     float FFT_Split_Frame       [FFT_SIZE * 2];
     float IFFT_Synth_Split_Frame[FFT_SIZE * 2];
     audio_block_t *blocklist[8];
