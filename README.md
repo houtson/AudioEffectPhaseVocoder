@@ -55,7 +55,7 @@ if (vocoder.getProfiling(meanUs, peakUs)) { ... }
 
 ## Memory
 
-The DSP arrays (~75 KB) live in fast DTCM (RAM1). The sample buffer must be placed in OCRAM or PSRAM to avoid overflowing DTCM:
+The DSP arrays (~75 KB) live in fast DTCM (RAM1). The sample buffer should be placed in OCRAM or PSRAM to avoid overflowing DTCM:
 
 ```cpp
 DMAMEM int16_t sampleBuffer[44100 * 5];   // Teensy 4.0/4.1 — OCRAM (~430 KB)

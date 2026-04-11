@@ -41,8 +41,9 @@ extern "C" {
 }
 
 #define FFT_SIZE      1024
-#define OVER_SAMPLE   8
+#define OVER_SAMPLE   8  // 8 = 8× oversampled FFT  sor 16 (64-sample hop). Higher = better transient response but more CPU.
 #define HALF_FFT_SIZE (FFT_SIZE / 2)
+#define SYNTH_HOP     (FFT_SIZE / OVER_SAMPLE)   // 64 — synthesis hop (samples per frame)
 
 // Stretch factor limits
 #define PV_STRETCH_MIN   0.5f
@@ -57,7 +58,7 @@ public:
                            playing(false),
                            looping(false),
                            stretch_factor(1.0f),
-                           analysis_hop((float)AUDIO_BLOCK_SAMPLES),
+                           analysis_hop((float)SYNTH_HOP),
                            prev_energy(0.0f),
                            transient_threshold(8.0f),
                            prof_sum(0), prof_peak(0), prof_count(0),
@@ -96,7 +97,7 @@ public:
         // analysis_hop write is 32-bit on Cortex-M7 (atomic), but volatile
         // ensures the ISR always reads the latest value.
         stretch_factor = factor;
-        analysis_hop   = (float)AUDIO_BLOCK_SAMPLES / stretch_factor;
+        analysis_hop   = (float)SYNTH_HOP / stretch_factor;
     }
 
     // Transient threshold — lower = more phase resets (sharper attacks).
@@ -207,15 +208,15 @@ private:
     volatile uint32_t prof_t_ifft;
     volatile uint32_t prof_t_ola;
 
-    float input_window          [FFT_SIZE];
-    float Phase_Sum             [FFT_SIZE];
-    float FFT_Frame             [FFT_SIZE];
-    float Last_Phase            [FFT_SIZE];
-    float Synth_Freq            [FFT_SIZE];
-    float Synth_Magn            [FFT_SIZE];
-    float Synth_Accum           [FFT_SIZE + AUDIO_BLOCK_SAMPLES];
-    float FFT_Split_Frame       [FFT_SIZE * 2];
-    float IFFT_Synth_Split_Frame[FFT_SIZE * 2];
+    float    input_window          [FFT_SIZE];
+    float    Phase_Sum             [FFT_SIZE];
+    float    FFT_Frame             [FFT_SIZE];
+    float    Last_Phase            [FFT_SIZE];
+    float    Synth_Freq            [FFT_SIZE];
+    float    Synth_Magn            [FFT_SIZE];
+    float    Synth_Accum           [FFT_SIZE + AUDIO_BLOCK_SAMPLES];
+    float    FFT_Split_Frame       [FFT_SIZE * 2];
+    float    IFFT_Synth_Split_Frame[FFT_SIZE * 2];
 };
 
 #endif

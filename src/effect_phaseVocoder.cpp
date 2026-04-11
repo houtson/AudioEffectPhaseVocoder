@@ -33,118 +33,135 @@ void AudioEffectPhaseVocoder::update(void) {
     elapsedMicros elapsed = 0;
     elapsedMicros sectionTimer = 0;
 
-    // Snapshot analysis_hop so it stays consistent within one frame even if
+    // Snapshot analysis_hop so it stays consistent across both frames even if
     // setStretch() is called from the main thread mid-update.
-    const float hop    = analysis_hop;
-    const int   ihop   = (int)hop;
-    const float expect = 2.0f * M_PI * hop / (float)FFT_SIZE;
+    const float hop       = analysis_hop;
+    const int   ihop      = (int)hop;
+    const float expect    = 2.0f * M_PI * hop / (float)FFT_SIZE;
 
-    // --- Slide the analysis window and fill from sample buffer ---
-    int slide = (ihop < FFT_SIZE) ? ihop : FFT_SIZE - 1;
-    memmove(input_window, input_window + slide, (FFT_SIZE - slide) * sizeof(float));
-
-    for (int i = 0; i < slide; i++) {
-        float pos = read_pos + (float)i;
-        if (looping && pos >= (float)sample_length)
-            pos = fmodf(pos, (float)sample_length);
-
-        uint32_t idx  = (uint32_t)pos;
-        float    frac = pos - (float)idx;
-        uint32_t idx1 = (looping && idx + 1 >= sample_length) ? 0 : idx + 1;
-
-        float s0 = (idx  < sample_length) ? sample_data[idx]  * (1.0f / 32768.0f) : 0.0f;
-        float s1 = (idx1 < sample_length) ? sample_data[idx1] * (1.0f / 32768.0f) : 0.0f;
-        input_window[FFT_SIZE - slide + i] = s0 + frac * (s1 - s0);
-    }
-
-    read_pos += hop;
-    if (read_pos >= (float)sample_length) {
-        if (looping) read_pos = fmodf(read_pos, (float)sample_length);
-        else         playing = false;
-    }
-
-    prof_t_window += (uint32_t)sectionTimer; sectionTimer = 0;
-
-    // --- Apply analysis window and forward FFT ---
-    for (int k = 0; k < FFT_SIZE; k++) {
-        FFT_Frame[k] = input_window[k] * window[k];
-    }
-    arm_cfft_f32(instance, FFT_Frame, 0, 1);
-    split_rfft_f32(FFT_Frame, HALF_FFT_SIZE, coefA, coefB, FFT_Split_Frame);
-
-    prof_t_fft += (uint32_t)sectionTimer; sectionTimer = 0;
-
-    // --- Phase analysis: compute true instantaneous frequency per bin ---
-    // Energy sum is folded in here to avoid a second pass over the data.
-    // Constant phase-step factor is hoisted out of the loop.
-    const float phase_step = 2.0f * M_PI * (float)AUDIO_BLOCK_SAMPLES / AUDIO_SAMPLE_RATE_EXACT;
+    // phase_step and norm are fixed to SYNTH_HOP (64), not AUDIO_BLOCK_SAMPLES (128).
+    // We run two SYNTH_HOP frames per update() to fill one audio block.
+    const float phase_step = 2.0f * M_PI * (float)SYNTH_HOP / AUDIO_SAMPLE_RATE_EXACT;
     const float freq_scale = FREQ_PER_BIN * (float)FFT_SIZE / (2.0f * M_PI * hop);
-    float energy = 0.0f;
+    const float norm       = (float)SYNTH_HOP / (float)HALF_FFT_SIZE;
 
-    for (int k = 0; k < HALF_FFT_SIZE; k++) {
-        float real  = FFT_Split_Frame[2 * k];
-        float imag  = FFT_Split_Frame[2 * k + 1];
-        float magn  = 2.0f * sqrtf(real * real + imag * imag);
-        float phase = atan2_fast(imag, real);
-
-        float delta = phase - Last_Phase[k] - expect * (float)k;
-        Last_Phase[k] = phase;
-
-        long qpd = (long)(delta / M_PI);
-        if (qpd >= 0) qpd += qpd & 1;
-        else          qpd -= qpd & 1;
-        delta -= M_PI * (float)qpd;
-
-        Synth_Magn[k] = magn;
-        Synth_Freq[k] = (float)k * FREQ_PER_BIN + freq_scale * delta;
-        energy += magn * magn;
-    }
-
-    prof_t_analysis += (uint32_t)sectionTimer; sectionTimer = 0;
-
-    // --- Transient detection ---
-    bool is_transient = (energy > prev_energy * transient_threshold);
-    prev_energy = energy;
-
-    // --- Phase synthesis: accumulate output phase at fixed synthesis hop ---
-    for (int k = 0; k < HALF_FFT_SIZE; k++) {
-        if (is_transient) {
-            Phase_Sum[k] = atan2_fast(FFT_Split_Frame[2 * k + 1], FFT_Split_Frame[2 * k]);
-        } else {
-            Phase_Sum[k] += phase_step * Synth_Freq[k];
-        }
-
-        float sinVal, cosVal;
-        arm_sin_cos_f32(Phase_Sum[k] * (180.0f / M_PI), &sinVal, &cosVal);
-        FFT_Split_Frame[2 * k]     = Synth_Magn[k] * cosVal;
-        FFT_Split_Frame[2 * k + 1] = Synth_Magn[k] * sinVal;
-    }
-
-    prof_t_synthesis += (uint32_t)sectionTimer; sectionTimer = 0;
-
-    // --- Inverse FFT ---
-    split_rifft_f32(FFT_Split_Frame, HALF_FFT_SIZE, coefA, coefB, IFFT_Synth_Split_Frame);
-    arm_cfft_f32(instance, IFFT_Synth_Split_Frame, 1, 1);
-
-    prof_t_ifft += (uint32_t)sectionTimer; sectionTimer = 0;
-
-    // --- Overlap-add into output accumulator ---
-    const float norm = (float)AUDIO_BLOCK_SAMPLES / (float)HALF_FFT_SIZE;
-    for (int k = 0; k < FFT_SIZE; k++) {
-        Synth_Accum[k] += IFFT_Synth_Split_Frame[k] * window[k] * norm;
-    }
+    int slide = (ihop < FFT_SIZE) ? ihop : FFT_SIZE - 1;
 
     audio_block_t *synthBlock = allocate();
+
+    // Run AUDIO_BLOCK_SAMPLES/SYNTH_HOP frames per update() to fill one audio block.
+    // With OVER_SAMPLE=16, SYNTH_HOP=64: 2 frames. With OVER_SAMPLE=8, SYNTH_HOP=128: 1 frame.
+    const int frames_per_block = AUDIO_BLOCK_SAMPLES / SYNTH_HOP;
+    for (int frame = 0; frame < frames_per_block; frame++) {
+
+        // --- Slide the analysis window and fill from sample buffer ---
+        memmove(input_window, input_window + slide, (FFT_SIZE - slide) * sizeof(float));
+
+        for (int i = 0; i < slide; i++) {
+            float pos = read_pos + (float)i;
+            if (looping && pos >= (float)sample_length)
+                pos = fmodf(pos, (float)sample_length);
+
+            uint32_t idx  = (uint32_t)pos;
+            float    frac = pos - (float)idx;
+            uint32_t idx1 = (looping && idx + 1 >= sample_length) ? 0 : idx + 1;
+
+            float s0 = (idx  < sample_length) ? sample_data[idx]  * (1.0f / 32768.0f) : 0.0f;
+            float s1 = (idx1 < sample_length) ? sample_data[idx1] * (1.0f / 32768.0f) : 0.0f;
+            input_window[FFT_SIZE - slide + i] = s0 + frac * (s1 - s0);
+        }
+
+        read_pos += hop;
+        if (read_pos >= (float)sample_length) {
+            if (looping) read_pos = fmodf(read_pos, (float)sample_length);
+            else         playing = false;
+        }
+
+        prof_t_window += (uint32_t)sectionTimer; sectionTimer = 0;
+
+        // --- Apply analysis window and forward FFT ---
+        for (int k = 0; k < FFT_SIZE; k++) {
+            FFT_Frame[k] = input_window[k] * window[k];
+        }
+        arm_cfft_f32(instance, FFT_Frame, 0, 1);
+        split_rfft_f32(FFT_Frame, HALF_FFT_SIZE, coefA, coefB, FFT_Split_Frame);
+
+        prof_t_fft += (uint32_t)sectionTimer; sectionTimer = 0;
+
+        // --- Phase analysis: compute true instantaneous frequency per bin ---
+        float energy = 0.0f;
+
+        for (int k = 0; k < HALF_FFT_SIZE; k++) {
+            float real  = FFT_Split_Frame[2 * k];
+            float imag  = FFT_Split_Frame[2 * k + 1];
+            float magn  = 2.0f * sqrtf(real * real + imag * imag);
+            float phase = atan2f(imag, real);
+
+            float delta = phase - Last_Phase[k] - expect * (float)k;
+            Last_Phase[k] = phase;
+
+            long qpd = (long)(delta / M_PI);
+            if (qpd >= 0) qpd += qpd & 1;
+            else          qpd -= qpd & 1;
+            delta -= M_PI * (float)qpd;
+
+            Synth_Magn[k] = magn;
+            Synth_Freq[k] = (float)k * FREQ_PER_BIN + freq_scale * delta;
+            energy += magn * magn;
+        }
+
+        prof_t_analysis += (uint32_t)sectionTimer; sectionTimer = 0;
+
+        // --- Transient detection ---
+        bool is_transient = (energy > prev_energy * transient_threshold);
+        prev_energy = energy;
+
+        // --- Phase synthesis: accumulate output phase at fixed synthesis hop ---
+        for (int k = 0; k < HALF_FFT_SIZE; k++) {
+            if (is_transient) {
+                Phase_Sum[k] = atan2f(FFT_Split_Frame[2 * k + 1], FFT_Split_Frame[2 * k]);
+            } else {
+                Phase_Sum[k] += phase_step * Synth_Freq[k];
+            }
+
+            float sinVal, cosVal;
+            arm_sin_cos_f32(Phase_Sum[k] * (180.0f / M_PI), &sinVal, &cosVal);
+            FFT_Split_Frame[2 * k]     = Synth_Magn[k] * cosVal;
+            FFT_Split_Frame[2 * k + 1] = Synth_Magn[k] * sinVal;
+        }
+
+        prof_t_synthesis += (uint32_t)sectionTimer; sectionTimer = 0;
+
+        // --- Inverse FFT ---
+        split_rifft_f32(FFT_Split_Frame, HALF_FFT_SIZE, coefA, coefB, IFFT_Synth_Split_Frame);
+        arm_cfft_f32(instance, IFFT_Synth_Split_Frame, 1, 1);
+
+        prof_t_ifft += (uint32_t)sectionTimer; sectionTimer = 0;
+
+        // --- Overlap-add into output accumulator ---
+        for (int k = 0; k < FFT_SIZE; k++) {
+            Synth_Accum[k] += IFFT_Synth_Split_Frame[k] * window[k] * norm;
+        }
+
+        // Write this frame's SYNTH_HOP samples into the output block.
+        if (synthBlock) {
+            arm_float_to_q15(Synth_Accum, synthBlock->data + frame * SYNTH_HOP, SYNTH_HOP);
+        }
+
+        // Advance the accumulator by one synthesis hop.
+        // Array size is FFT_SIZE + AUDIO_BLOCK_SAMPLES; shift left by SYNTH_HOP.
+        memmove(Synth_Accum, Synth_Accum + SYNTH_HOP,
+                (FFT_SIZE + AUDIO_BLOCK_SAMPLES - SYNTH_HOP) * sizeof(float));
+        memset(Synth_Accum + FFT_SIZE + AUDIO_BLOCK_SAMPLES - SYNTH_HOP, 0,
+               SYNTH_HOP * sizeof(float));
+
+        prof_t_ola += (uint32_t)sectionTimer; sectionTimer = 0;
+    }
+
     if (synthBlock) {
-        arm_float_to_q15(Synth_Accum, synthBlock->data, AUDIO_BLOCK_SAMPLES);
         transmit(synthBlock);
         release(synthBlock);
     }
-
-    memmove(Synth_Accum, Synth_Accum + (int)(float)AUDIO_BLOCK_SAMPLES, FFT_SIZE * sizeof(float));
-    memset(Synth_Accum + FFT_SIZE, 0, AUDIO_BLOCK_SAMPLES * sizeof(float));
-
-    prof_t_ola += (uint32_t)sectionTimer;
 
     // --- Total profiling ---
     const uint32_t us = (uint32_t)elapsed;
