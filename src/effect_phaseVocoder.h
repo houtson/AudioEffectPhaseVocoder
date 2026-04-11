@@ -26,6 +26,7 @@
 #define phase_vocoder_h_
 
 #include "Arduino.h"
+#include <Audio.h>
 #include "AudioStream.h"
 #include <arm_math.h>
 #include "arm_const_structs.h"
@@ -43,9 +44,9 @@ extern "C" {
 #define OVER_SAMPLE   8
 #define HALF_FFT_SIZE (FFT_SIZE / 2)
 
-// Stretch factor limits — analysis_hop must stay within [1, FFT_SIZE)
-#define PV_STRETCH_MIN   0.1f
-#define PV_STRETCH_MAX   10.0f
+// Stretch factor limits
+#define PV_STRETCH_MIN   0.5f
+#define PV_STRETCH_MAX   1.5f
 
 class AudioEffectPhaseVocoder : public AudioStream {
 public:
@@ -56,7 +57,12 @@ public:
                            playing(false),
                            looping(false),
                            stretch_factor(1.0f),
-                           analysis_hop((float)(FFT_SIZE / OVER_SAMPLE))
+                           analysis_hop((float)AUDIO_BLOCK_SAMPLES),
+                           prev_energy(0.0f),
+                           transient_threshold(8.0f),
+                           prof_sum(0), prof_peak(0), prof_count(0),
+                           prof_t_window(0), prof_t_fft(0), prof_t_analysis(0),
+                           prof_t_synthesis(0), prof_t_ifft(0), prof_t_ola(0)
     {
         memset(input_window, 0, FFT_SIZE * sizeof(float));
         memset(Last_Phase,   0, FFT_SIZE * sizeof(float));
@@ -69,14 +75,17 @@ public:
     }
 
     void setSample(const int16_t *data, uint32_t numSamples) {
+        AudioNoInterrupts();
         playing       = false;
         sample_data   = data;
         sample_length = numSamples;
         read_pos      = 0.0f;
+        prev_energy   = 0.0f;
         memset(input_window, 0, FFT_SIZE * sizeof(float));
         memset(Last_Phase,   0, FFT_SIZE * sizeof(float));
         memset(Phase_Sum,    0, FFT_SIZE * sizeof(float));
         memset(Synth_Accum,  0, (FFT_SIZE + AUDIO_BLOCK_SAMPLES) * sizeof(float));
+        AudioInterrupts();
     }
 
     // stretch > 1.0 = slower (e.g. 2.0 = double duration)
@@ -84,16 +93,77 @@ public:
     void setStretch(float factor) {
         if (factor < PV_STRETCH_MIN) factor = PV_STRETCH_MIN;
         if (factor > PV_STRETCH_MAX) factor = PV_STRETCH_MAX;
+        // analysis_hop write is 32-bit on Cortex-M7 (atomic), but volatile
+        // ensures the ISR always reads the latest value.
         stretch_factor = factor;
         analysis_hop   = (float)AUDIO_BLOCK_SAMPLES / stretch_factor;
     }
 
-    float getStretch() { return stretch_factor; }
+    // Transient threshold — lower = more phase resets (sharper attacks).
+    // Default 8.0 works well for drums. Tune to taste.
+    void setTransientThreshold(float t) { transient_threshold = t; }
 
-    void play()             { if (sample_data) playing = true; }
-    void stop()             { playing = false; read_pos = 0.0f; }
+    float getStretch()             const { return stretch_factor; }
+    float getTransientThreshold()  const { return transient_threshold; }
+
+    void play() {
+        if (!sample_data) return;
+        AudioNoInterrupts();
+        read_pos    = 0.0f;
+        prev_energy = 0.0f;
+        memset(input_window, 0, FFT_SIZE * sizeof(float));
+        memset(Last_Phase,   0, FFT_SIZE * sizeof(float));
+        memset(Phase_Sum,    0, FFT_SIZE * sizeof(float));
+        memset(Synth_Accum,  0, (FFT_SIZE + AUDIO_BLOCK_SAMPLES) * sizeof(float));
+        playing = true;
+        AudioInterrupts();
+    }
+
+    void stop() {
+        AudioNoInterrupts();
+        playing  = false;
+        read_pos = 0.0f;
+        AudioInterrupts();
+    }
+
     void setLoop(bool loop) { looping = loop; }
     bool isPlaying()        { return playing; }
+
+    // Returns mean and peak update() execution time in microseconds since the
+    // last call, then resets the accumulators. Returns false if no data yet.
+    bool getProfiling(float &meanUs, uint32_t &peakUs) {
+        AudioNoInterrupts();
+        const uint32_t sum   = prof_sum;
+        const uint32_t count = prof_count;
+        const uint32_t peak  = prof_peak;
+        prof_sum = prof_peak = prof_count = 0;
+        AudioInterrupts();
+        if (count == 0) return false;
+        meanUs = (float)sum / (float)count;
+        peakUs = peak;
+        return true;
+    }
+
+    // Per-section mean costs (µs) accumulated since last call.
+    // Sections: window fill | forward FFT | phase analysis | phase synthesis | inverse FFT | OLA
+    bool getProfilingDetailed(float &tWindow, float &tFft, float &tAnalysis,
+                              float &tSynthesis, float &tIfft, float &tOla) {
+        AudioNoInterrupts();
+        const uint32_t count = prof_count;
+        const uint32_t w = prof_t_window, f = prof_t_fft, a = prof_t_analysis;
+        const uint32_t s = prof_t_synthesis, i = prof_t_ifft, o = prof_t_ola;
+        prof_t_window = prof_t_fft = prof_t_analysis = 0;
+        prof_t_synthesis = prof_t_ifft = prof_t_ola = 0;
+        AudioInterrupts();
+        if (count == 0) return false;
+        tWindow    = (float)w / count;
+        tFft       = (float)f / count;
+        tAnalysis  = (float)a / count;
+        tSynthesis = (float)s / count;
+        tIfft      = (float)i / count;
+        tOla       = (float)o / count;
+        return true;
+    }
 
     // Stub — pitch shifting not yet implemented
     void setPitchShift(float semitones) { (void)semitones; }
@@ -101,16 +171,20 @@ public:
     virtual void update(void);
 
 private:
-    // Sample buffer
-    const int16_t *sample_data;
-    uint32_t       sample_length;
-    float          read_pos;
-    bool           playing;
-    bool           looping;
+    // Sample buffer (written from main thread, read from ISR — use AudioNoInterrupts guards)
+    const int16_t    *sample_data;
+    uint32_t          sample_length;
+    float             read_pos;
+    volatile bool     playing;
+    bool              looping;
 
-    // Stretch control
-    float stretch_factor;
-    float analysis_hop;   // = AUDIO_BLOCK_SAMPLES / stretch_factor (can be fractional)
+    // Stretch control (analysis_hop read from ISR, written from main thread)
+    volatile float stretch_factor;
+    volatile float analysis_hop;
+
+    // Transient detection
+    float prev_energy;
+    float transient_threshold;
 
     // DSP resources
     const float *window;
@@ -118,8 +192,20 @@ private:
     const float *coefB;
     const arm_cfft_instance_f32 *instance;
 
-    // Fixed constants
+    // Fixed constant
     const float FREQ_PER_BIN = AUDIO_SAMPLE_RATE_EXACT / (float)FFT_SIZE;
+
+    // Profiling — total
+    volatile uint32_t prof_sum;
+    volatile uint32_t prof_peak;
+    volatile uint32_t prof_count;
+    // Profiling — per section
+    volatile uint32_t prof_t_window;
+    volatile uint32_t prof_t_fft;
+    volatile uint32_t prof_t_analysis;
+    volatile uint32_t prof_t_synthesis;
+    volatile uint32_t prof_t_ifft;
+    volatile uint32_t prof_t_ola;
 
     float input_window          [FFT_SIZE];
     float Phase_Sum             [FFT_SIZE];

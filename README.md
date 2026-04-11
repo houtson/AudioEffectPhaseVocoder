@@ -1,52 +1,81 @@
 # AudioEffectPhaseVocoder
 
-A phase vocoder audio effect for Teensy 3.5+/4, forked from [duff2013/AudioEffectVocoder](https://github.com/duff2013/AudioEffectVocoder) by Colin Duffy.
+A phase vocoder audio effect for Teensy 4.x, forked from [duff2013/AudioEffectVocoder](https://github.com/duff2013/AudioEffectVocoder) by Colin Duffy.
 
 ## About this fork
 
-This fork extends the original phase vocoder with **time-stretching** — the ability to play back audio samples at variable speeds without changing pitch. The effect is designed for use with the [Teensy Audio Library](https://www.pjrc.com/teensy/td_libs_Audio.html).
+This fork adds **time-stretching** — playing audio at variable speed without changing pitch. The effect owns its sample buffer directly (loaded from SD or PSRAM) and integrates with the [Teensy Audio Library](https://www.pjrc.com/teensy/td_libs_Audio.html) as a 0-input / 1-output node.
 
-## Status
+**Target hardware:** Teensy 4.0 / 4.1 + Audio Shield (SGTL5000). Requires Teensy 4 due to the CMSIS 5 FFT API (`arm_cfft_f32`).
 
-Active development. See the [Development Plan](Development%20Plan%20-%20Phase%20Vocoder%20Time-Str) for the full roadmap.
-
-| Phase | Description | Status |
-| ----- | ----------- | ------ |
-| 1 | Cleanup & bug fixes | In progress |
-| 2 | Internalize sample playback | Planned |
-| 3 | Time-stretching | Planned |
-| 4 | Transient handling (drums) | Planned |
-
-## Planned API
+## API
 
 ```cpp
 AudioEffectPhaseVocoder vocoder;
 
-vocoder.setSample(data, numSamples); // point to a sample buffer
-vocoder.setStretch(2.0f);           // 2.0 = double duration (slower)
-vocoder.setLoop(true);
+// Load a sample (mono 16-bit PCM, 44100 Hz)
+vocoder.setSample(sampleBuffer, numSamples);
+
+// Playback control
 vocoder.play();
+vocoder.stop();
+vocoder.setLoop(true);
+bool playing = vocoder.isPlaying();
+
+// Time-stretching
+// > 1.0 = slower (e.g. 2.0 = double duration)
+// < 1.0 = faster (e.g. 0.5 = half duration)
+vocoder.setStretch(1.5f);
+float s = vocoder.getStretch();
+
+// Transient detection sensitivity (default 8.0)
+// Lower = more phase resets on attacks → better transient preservation
+// Higher = fewer resets → smoother sustain
+vocoder.setTransientThreshold(8.0f);
+
+// Performance profiling
+float meanUs; uint32_t peakUs;
+if (vocoder.getProfiling(meanUs, peakUs)) { ... }
 ```
 
-## Parameters
+## Example sketch controls (Serial)
 
-- `setStretch(float factor)` — `1.0` = normal speed, `2.0` = half speed, `0.5` = double speed
-- `setSample(const int16_t *data, uint32_t numSamples)` — load a sample buffer
-- `play()` / `stop()` / `isPlaying()`
-- `setLoop(bool loop)`
+| Key   | Action                              |
+| ----- | ----------------------------------- |
+| SPACE | Start / restart                     |
+| s     | Stop                                |
+| p     | Faster                              |
+| q     | Slower                              |
+| 1-3   | Load 01.WAV / 02.WAV / 03.WAV      |
+| t     | Transient threshold: 4 (sensitive)  |
+| y     | Transient threshold: 8 (default)    |
+| u     | Transient threshold: 16 (subtle)    |
+| d     | Toggle profiling report             |
+| h     | Help                                |
+
+## Memory
+
+The DSP arrays (~75 KB) live in fast DTCM (RAM1). The sample buffer must be placed in OCRAM or PSRAM to avoid overflowing DTCM:
+
+```cpp
+DMAMEM int16_t sampleBuffer[44100 * 5];   // Teensy 4.0/4.1 — OCRAM (~430 KB)
+EXTMEM int16_t sampleBuffer[44100 * 60];  // Teensy 4.1 + PSRAM — up to ~8 MB
+```
 
 ## How it works
 
-The phase vocoder uses a Short-Time Fourier Transform (STFT) to analyze overlapping frames of audio, manipulate the phase spectrum, and reconstruct the output. Time-stretching is achieved by decoupling the analysis hop (how fast input is consumed) from the synthesis hop (always 128 samples, locked to Teensy's audio block rate):
+The phase vocoder uses a Short-Time Fourier Transform (STFT) to analyse overlapping frames of audio, manipulate the phase spectrum, and reconstruct the output. Time-stretching decouples the analysis hop (how fast input is consumed) from the synthesis hop (always 128 samples, locked to Teensy's audio block rate):
 
 ```text
 stretch_factor = synthesis_hop / analysis_hop
 ```
 
-- `stretch > 1` → reads input slowly → output is longer (slower playback)
-- `stretch < 1` → reads input fast → output is shorter (faster playback)
+- `stretch > 1` → smaller analysis hop → reads input slowly → longer output
+- `stretch < 1` → larger analysis hop → reads input fast → shorter output
 
-**FFT size:** 1024 — **Overlap:** 8x — **Platform:** Teensy 3.5+ / 4.x
+Transient frames (sharp energy increases) trigger a phase reset — `Phase_Sum` is set to the analysis phase rather than accumulated — which preserves harmonic relationships on drum hits and attacks.
+
+**FFT size:** 1024 — **Overlap:** 8× — **Platform:** Teensy 4.0 / 4.1
 
 ## Credits
 
