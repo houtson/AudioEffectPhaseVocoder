@@ -89,7 +89,10 @@ void AudioEffectPhaseVocoder::update(void) {
         prof_t_fft += (uint32_t)sectionTimer; sectionTimer = 0;
 
         // --- Phase analysis: compute true instantaneous frequency per bin ---
-        float energy = 0.0f;
+        // Spectral flux (sum of positive magnitude increases) is folded in here.
+        // It fires only when new spectral content appears — unlike energy ratio,
+        // it does not misfire on loud sustained frames.
+        float flux = 0.0f;
 
         for (int k = 0; k < HALF_FFT_SIZE; k++) {
             float real  = FFT_Split_Frame[2 * k];
@@ -107,14 +110,19 @@ void AudioEffectPhaseVocoder::update(void) {
 
             Synth_Magn[k] = magn;
             Synth_Freq[k] = (float)k * FREQ_PER_BIN + freq_scale * delta;
-            energy += magn * magn;
+
+            float diff = magn - Prev_Magn[k];
+            if (diff > 0.0f) flux += diff;
+            Prev_Magn[k] = magn;
         }
 
         prof_t_analysis += (uint32_t)sectionTimer; sectionTimer = 0;
 
-        // --- Transient detection ---
-        bool is_transient = (energy > prev_energy * transient_threshold);
-        prev_energy = energy;
+        // --- Transient detection via spectral flux ---
+        // Compare instantaneous flux against a smoothed reference.
+        // threshold > 1 — lower = more sensitive, higher = fewer resets.
+        bool is_transient = (flux > prev_flux * transient_threshold);
+        prev_flux = 0.8f * prev_flux + 0.2f * flux;
 
         // --- Phase synthesis: accumulate output phase at fixed synthesis hop ---
         for (int k = 0; k < HALF_FFT_SIZE; k++) {

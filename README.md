@@ -28,10 +28,11 @@ bool playing = vocoder.isPlaying();
 vocoder.setStretch(1.5f);
 float s = vocoder.getStretch();
 
-// Transient detection sensitivity (default 8.0)
+
+// Transient detection sensitivity (default 16.0)
 // Lower = more phase resets on attacks → better transient preservation
 // Higher = fewer resets → smoother sustain
-vocoder.setTransientThreshold(8.0f);
+vocoder.setTransientThreshold(16.0f);
 
 // Performance profiling
 float meanUs; uint32_t peakUs;

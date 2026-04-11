@@ -156,7 +156,7 @@ void setup() {
         return;
     }
 
-    vocoder.setTransientThreshold(8.0f);
+    vocoder.setTransientThreshold(16.0f);
     loadAndPlay(0);
     printHelp();
 }

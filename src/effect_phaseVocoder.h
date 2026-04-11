@@ -41,9 +41,9 @@ extern "C" {
 }
 
 #define FFT_SIZE      1024
-#define OVER_SAMPLE   8  // 8 = 8× oversampled FFT  sor 16 (64-sample hop). Higher = better transient response but more CPU.
+#define OVER_SAMPLE   8
 #define HALF_FFT_SIZE (FFT_SIZE / 2)
-#define SYNTH_HOP     (FFT_SIZE / OVER_SAMPLE)   // 64 — synthesis hop (samples per frame)
+#define SYNTH_HOP     (FFT_SIZE / OVER_SAMPLE)   // synthesis hop (samples per frame)
 
 // Stretch factor limits
 #define PV_STRETCH_MIN   0.5f
@@ -59,8 +59,8 @@ public:
                            looping(false),
                            stretch_factor(1.0f),
                            analysis_hop((float)SYNTH_HOP),
-                           prev_energy(0.0f),
-                           transient_threshold(8.0f),
+                           prev_flux(0.0f),
+                           transient_threshold(16.0f),
                            prof_sum(0), prof_peak(0), prof_count(0),
                            prof_t_window(0), prof_t_fft(0), prof_t_analysis(0),
                            prof_t_synthesis(0), prof_t_ifft(0), prof_t_ola(0)
@@ -69,6 +69,7 @@ public:
         memset(Last_Phase,   0, FFT_SIZE * sizeof(float));
         memset(Phase_Sum,    0, FFT_SIZE * sizeof(float));
         memset(Synth_Accum,  0, (FFT_SIZE + AUDIO_BLOCK_SAMPLES) * sizeof(float));
+        memset(Prev_Magn,    0, HALF_FFT_SIZE * sizeof(float));
         instance = &arm_cfft_sR_f32_len512;
         window   = win1024_f32;
         coefA    = coefA_512_f32;
@@ -81,11 +82,12 @@ public:
         sample_data   = data;
         sample_length = numSamples;
         read_pos      = 0.0f;
-        prev_energy   = 0.0f;
+        prev_flux     = 0.0f;
         memset(input_window, 0, FFT_SIZE * sizeof(float));
         memset(Last_Phase,   0, FFT_SIZE * sizeof(float));
         memset(Phase_Sum,    0, FFT_SIZE * sizeof(float));
         memset(Synth_Accum,  0, (FFT_SIZE + AUDIO_BLOCK_SAMPLES) * sizeof(float));
+        memset(Prev_Magn,    0, HALF_FFT_SIZE * sizeof(float));
         AudioInterrupts();
     }
 
@@ -101,7 +103,7 @@ public:
     }
 
     // Transient threshold — lower = more phase resets (sharper attacks).
-    // Default 8.0 works well for drums. Tune to taste.
+    // Default 16.0. Tune to taste.
     void setTransientThreshold(float t) { transient_threshold = t; }
 
     float getStretch()             const { return stretch_factor; }
@@ -110,12 +112,13 @@ public:
     void play() {
         if (!sample_data) return;
         AudioNoInterrupts();
-        read_pos    = 0.0f;
-        prev_energy = 0.0f;
+        read_pos      = 0.0f;
+        prev_flux     = 0.0f;
         memset(input_window, 0, FFT_SIZE * sizeof(float));
         memset(Last_Phase,   0, FFT_SIZE * sizeof(float));
         memset(Phase_Sum,    0, FFT_SIZE * sizeof(float));
         memset(Synth_Accum,  0, (FFT_SIZE + AUDIO_BLOCK_SAMPLES) * sizeof(float));
+        memset(Prev_Magn,    0, HALF_FFT_SIZE * sizeof(float));
         playing = true;
         AudioInterrupts();
     }
@@ -183,9 +186,10 @@ private:
     volatile float stretch_factor;
     volatile float analysis_hop;
 
-    // Transient detection
-    float prev_energy;
+    // Transient detection (spectral flux)
+    float prev_flux;
     float transient_threshold;
+    float Prev_Magn[HALF_FFT_SIZE];
 
     // DSP resources
     const float *window;
