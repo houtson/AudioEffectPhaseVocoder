@@ -13,10 +13,8 @@
 //   Mono, 16-bit PCM, 44100 Hz.
 //
 // --- PHASE STATUS ---
-// Phase 1 (current): Effect is 1-in/1-out; AudioPlaySdWav feeds it from SD.
-// Phase 2: Effect becomes 0-in/1-out and owns the sample buffer directly.
-//          setSample(), play(), stop(), setLoop() will replace AudioPlaySdWav.
-// Phase 3: setStretch() / setSpeed() will be active.
+// Phase 3 (current): Time-stretching active via setStretch().
+//                    p/q keys adjust stretch factor. Pot support optional.
 
 #include <Audio.h>
 #include <Wire.h>
@@ -25,37 +23,26 @@
 #include "effect_phaseVocoder.h"
 
 // ---------------------------------------------------------------------------
-// Audio graph
+// Audio graph — vocoder is 0-input/1-output, owns its own sample buffer
 // ---------------------------------------------------------------------------
-
-// --- Phase 1 only: temporary WAV source feeding the vocoder ---
-AudioPlaySdWav           voice;
 AudioEffectPhaseVocoder  vocoder;
-AudioOutputI2S           audioOut;
-AudioControlSGTL5000     codec;
+AudioOutputUSB audioOut;
+//AudioOutputI2S audioOut;
+//AudioControlSGTL5000 codec;
 
-// Phase 1 connections — voice feeds vocoder
-AudioConnection patchIn   (voice,   0, vocoder, 0);
-AudioConnection patchLeft (vocoder, 0, audioOut, 0);
+AudioConnection patchLeft(vocoder, 0, audioOut, 0);
 AudioConnection patchRight(vocoder, 0, audioOut, 1);
-
-// --- Phase 2: remove voice, patchIn, and uncomment this block ---
-// AudioEffectPhaseVocoder  vocoder;
-// AudioOutputI2S           audioOut;
-// AudioControlSGTL5000     codec;
-// AudioConnection patchLeft (vocoder, 0, audioOut, 0);
-// AudioConnection patchRight(vocoder, 0, audioOut, 1);
 
 // ---------------------------------------------------------------------------
 // Pin & timing config
 // ---------------------------------------------------------------------------
 static const int   POT_PIN      = A0;
-static const float SPEED_MIN    = 0.5f;   // full CCW → half speed
-static const float SPEED_MAX    = 1.5f;   // full CW  → 1.5× speed
-static const int   POT_READ_MS  = 50;     // read pot every 50 ms
-static const float CONTROL_STEP = 0.02f;
+static const float STRETCH_MIN  = 0.5f;   // 0.5 = half duration (faster)
+static const float STRETCH_MAX  = 2.0f;   // 2.0 = double duration (slower)
+static const int   POT_READ_MS  = 50;
+static const float CONTROL_STEP = 0.05f;
 static const bool  USE_POT      = false;
-float speed = 1.0f;
+float stretch = 1.0f;
 
 static float clampf(float value, float lo, float hi)
 {
@@ -64,24 +51,56 @@ static float clampf(float value, float lo, float hi)
     return value;
 }
 
-static void applySpeed(float newSpeed)
+static void applyStretch(float newStretch)
 {
-    speed = clampf(newSpeed, SPEED_MIN, SPEED_MAX);
+    stretch = clampf(newStretch, STRETCH_MIN, STRETCH_MAX);
+    vocoder.setStretch(stretch);
 
-    // Phase 3: uncomment when setStretch() is implemented
-    // vocoder.setStretch(speed);
-
-    Serial.print("Speed: ");
-    Serial.print(speed, 3);
-    Serial.println("x  (stretch control not yet active — Phase 3)");
+    Serial.print("Stretch: ");
+    Serial.print(stretch, 2);
+    Serial.print("x  (");
+    Serial.print(1.0f / stretch, 2);
+    Serial.println("x speed)");
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2: sample buffer — fill this before calling vocoder.setSample().
-// Replace with your own loader (SD card, USB, etc.).
-// int16_t sampleBuffer[44100 * 3];  // ~3 s at 44100 Hz
-// static uint32_t sampleCount = 0;
+// Sample buffer — loaded from SD into RAM at startup
+// Adjust size to fit your sample. 44100*5 = ~5 s mono at 44100 Hz.
+// On Teensy 4.1 with PSRAM: use EXTMEM int16_t sampleBuffer[...];
 // ---------------------------------------------------------------------------
+// For Teensy 4.1 with PSRAM, replace DMAMEM with EXTMEM for up to 16MB.
+DMAMEM int16_t sampleBuffer[44100 * 5];
+static uint32_t sampleCount = 0;
+
+// ---------------------------------------------------------------------------
+// Load raw 16-bit PCM from SD. Skips a standard 44-byte WAV header.
+// ---------------------------------------------------------------------------
+bool loadSampleFromSD(const char *filename)
+{
+    File f = SD.open(filename);
+    if (!f) {
+        Serial.print("Could not open: ");
+        Serial.println(filename);
+        return false;
+    }
+
+    f.seek(44);  // skip WAV header
+    sampleCount = 0;
+    const uint32_t maxSamples = sizeof(sampleBuffer) / sizeof(sampleBuffer[0]);
+
+    while (f.available() && sampleCount < maxSamples) {
+        int lo = f.read();
+        int hi = f.read();
+        if (lo < 0 || hi < 0) break;
+        sampleBuffer[sampleCount++] = (int16_t)((hi << 8) | lo);
+    }
+    f.close();
+
+    Serial.print("Loaded ");
+    Serial.print(sampleCount);
+    Serial.println(" samples");
+    return sampleCount > 0;
+}
 
 // ---------------------------------------------------------------------------
 // setup
@@ -91,25 +110,21 @@ void setup()
     AudioMemory(40);
     Serial.begin(57600);
 
-    codec.enable();
-    codec.volume(0.5f);
+   // codec.enable();
+    //codec.volume(0.5f);
 
     if (!SD.begin(BUILTIN_SDCARD)) {
         Serial.println("SD init failed");
         return;
     }
 
-    // Phase 1: play directly from SD via AudioPlaySdWav
-    applySpeed(speed);
-    voice.play("01.WAV");
-
-    // --- Phase 2: load raw PCM into buffer and hand to vocoder ---
-    // if (loadSampleFromSD("01.wav")) {
-    //     vocoder.setSample(sampleBuffer, sampleCount);
-    //     vocoder.setLoop(true);
-    //     applySpeed(speed);
-    //     vocoder.play();
-    // }
+    if (loadSampleFromSD("01.WAV")) {
+        vocoder.setSample(sampleBuffer, sampleCount);
+        vocoder.setLoop(true);
+        applyStretch(stretch);
+        vocoder.play();
+        Serial.println("p = slower, q = faster, r = restart, s = stop");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -119,25 +134,23 @@ void loop()
 {
     static uint32_t lastRead = 0;
 
-    // Phase 1: restart when playback finishes
-    if (!voice.isPlaying()) {
-        voice.play("01.WAV");
-    }
-
     if (Serial.available() > 0)
     {
         char key = Serial.read();
 
         if (key == 'p') {
-            applySpeed(speed + CONTROL_STEP);
+            applyStretch(stretch + CONTROL_STEP);  // slower
         }
         else if (key == 'q') {
-            applySpeed(speed - CONTROL_STEP);
+            applyStretch(stretch - CONTROL_STEP);  // faster
         }
-        // Phase 1: 'r' replays from the beginning
         else if (key == 'r') {
-            voice.stop();
-            voice.play("01.WAV");
+            vocoder.stop();
+            vocoder.play();
+        }
+        else if (key == 's') {
+            vocoder.stop();
+            Serial.println("Stopped");
         }
     }
 
@@ -145,29 +158,7 @@ void loop()
     {
         lastRead = millis();
         int raw = analogRead(POT_PIN);
-        float mappedSpeed = SPEED_MIN + (raw / 1023.0f) * (SPEED_MAX - SPEED_MIN);
-        applySpeed(mappedSpeed);
+        float mappedStretch = STRETCH_MIN + (raw / 1023.0f) * (STRETCH_MAX - STRETCH_MIN);
+        applyStretch(mappedStretch);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Phase 2: SD loader — uncomment when setSample() is implemented
-// ---------------------------------------------------------------------------
-// bool loadSampleFromSD(const char *filename)
-// {
-//     File f = SD.open(filename);
-//     if (!f)
-//         return false;
-//
-//     f.seek(44);  // skip 44-byte WAV header
-//     sampleCount = 0;
-//     while (f.available() && sampleCount < sizeof(sampleBuffer) / sizeof(sampleBuffer[0]))
-//     {
-//         int lo = f.read();
-//         int hi = f.read();
-//         if (lo < 0 || hi < 0) break;
-//         sampleBuffer[sampleCount++] = (int16_t)((hi << 8) | lo);
-//     }
-//     f.close();
-//     return sampleCount > 0;
-// }
