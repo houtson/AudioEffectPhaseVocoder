@@ -30,6 +30,45 @@ void AudioEffectPhaseVocoder::update(void) {
 
     if (!playing) return;
 
+    // --- Passthrough: bypass phase vocoder at unity stretch and pitch ---
+    if (stretch_factor == 1.0f && pitch_ratio == 1.0f) {
+        audio_block_t *passBlock = allocate();
+        if (passBlock) {
+            for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++) {
+                float pos = read_pos + (float)i;
+                if (looping && pos >= (float)sample_length)
+                    pos = fmodf(pos, (float)sample_length);
+                uint32_t idx  = (uint32_t)pos;
+                float    frac = pos - (float)idx;
+                uint32_t idx1 = (looping && idx + 1 >= sample_length) ? 0 : idx + 1;
+                float s0 = (idx  < sample_length) ? sample_data[idx]  * (1.0f / 32768.0f) : 0.0f;
+                float s1 = (idx1 < sample_length) ? sample_data[idx1] * (1.0f / 32768.0f) : 0.0f;
+                int32_t out = (int32_t)((s0 + frac * (s1 - s0)) * 32768.0f);
+                passBlock->data[i] = (int16_t)__SSAT(out, 16);
+            }
+            transmit(passBlock);
+            release(passBlock);
+        }
+        read_pos += (float)AUDIO_BLOCK_SAMPLES;
+        if (read_pos >= (float)sample_length) {
+            if (looping) read_pos = fmodf(read_pos, (float)sample_length);
+            else         playing = false;
+        }
+        was_passthrough = true;
+        return;
+    }
+
+    // Flush stale PV state if we just left passthrough mode — prevents a click.
+    if (was_passthrough) {
+        memset(input_window, 0, FFT_SIZE * sizeof(float));
+        memset(Last_Phase,   0, FFT_SIZE * sizeof(float));
+        memset(Phase_Sum,    0, FFT_SIZE * sizeof(float));
+        memset(Synth_Accum,  0, (FFT_SIZE + AUDIO_BLOCK_SAMPLES) * sizeof(float));
+        memset(Prev_Magn,    0, HALF_FFT_SIZE * sizeof(float));
+        prev_flux       = 0.0f;
+        was_passthrough = false;
+    }
+
     elapsedMicros elapsed = 0;
     elapsedMicros sectionTimer = 0;
 
@@ -98,7 +137,7 @@ void AudioEffectPhaseVocoder::update(void) {
             float real  = FFT_Split_Frame[2 * k];
             float imag  = FFT_Split_Frame[2 * k + 1];
             float magn  = 2.0f * sqrtf(real * real + imag * imag);
-            float phase = atan2f(imag, real);
+            float phase = atan2_fast(imag, real);
 
             float delta = phase - Last_Phase[k] - expect * (float)k;
             Last_Phase[k] = phase;
@@ -140,15 +179,27 @@ void AudioEffectPhaseVocoder::update(void) {
             memset(FFT_Frame, 0, FFT_SIZE * sizeof(float));
 
             for (int k = 0; k < HALF_FFT_SIZE; k++) {
-                int dk = (int)((float)k * pr);
-                if (dk >= HALF_FFT_SIZE) break;
-                out_magn[dk] += Synth_Magn[k];
-                out_freq[dk]  = Synth_Freq[k] * pr;  // true frequency scales with pitch ratio
+                float fdk  = (float)k * pr;
+                int   dk0  = (int)fdk;
+                int   dk1  = dk0 + 1;
+                float frac = fdk - (float)dk0;   // weight towards dk1
+
+                if (dk0 >= HALF_FFT_SIZE) break;
+
+                // Distribute magnitude linearly across the two neighbouring bins.
+                // True frequency at each output bin scales with pitch ratio.
+                out_magn[dk0] += Synth_Magn[k] * (1.0f - frac);
+                out_freq[dk0]  = Synth_Freq[k] * pr;
+
+                if (dk1 < HALF_FFT_SIZE) {
+                    out_magn[dk1] += Synth_Magn[k] * frac;
+                    out_freq[dk1]  = Synth_Freq[k] * pr;
+                }
             }
 
             for (int k = 0; k < HALF_FFT_SIZE; k++) {
                 if (is_transient) {
-                    Phase_Sum[k] = atan2f(FFT_Split_Frame[2 * k + 1], FFT_Split_Frame[2 * k]);
+                    Phase_Sum[k] = atan2_fast(FFT_Split_Frame[2 * k + 1], FFT_Split_Frame[2 * k]);
                 } else {
                     Phase_Sum[k] += phase_step * out_freq[k];
                 }
@@ -160,14 +211,15 @@ void AudioEffectPhaseVocoder::update(void) {
         } else {
             for (int k = 0; k < HALF_FFT_SIZE; k++) {
                 if (is_transient) {
-                    Phase_Sum[k] = atan2f(FFT_Split_Frame[2 * k + 1], FFT_Split_Frame[2 * k]);
+                    Phase_Sum[k] = atan2_fast(FFT_Split_Frame[2 * k + 1], FFT_Split_Frame[2 * k]);
                 } else {
                     Phase_Sum[k] += phase_step * Synth_Freq[k];
+                    // Wrap to [-π, π] to prevent float precision loss over time.
+                    if (Phase_Sum[k] >  M_PI) Phase_Sum[k] -= 2.0f * M_PI;
+                    if (Phase_Sum[k] < -M_PI) Phase_Sum[k] += 2.0f * M_PI;
                 }
-                float sinVal, cosVal;
-                arm_sin_cos_f32(Phase_Sum[k] * (180.0f / M_PI), &sinVal, &cosVal);
-                FFT_Split_Frame[2 * k]     = Synth_Magn[k] * cosVal;
-                FFT_Split_Frame[2 * k + 1] = Synth_Magn[k] * sinVal;
+                FFT_Split_Frame[2 * k]     = Synth_Magn[k] * arm_cos_f32(Phase_Sum[k]);
+                FFT_Split_Frame[2 * k + 1] = Synth_Magn[k] * arm_sin_f32(Phase_Sum[k]);
             }
         }
 

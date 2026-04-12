@@ -61,6 +61,7 @@ public:
                            analysis_hop((float)SYNTH_HOP),
                            pitch_ratio(1.0f),
                            pitch_semitones(0.0f),
+                           was_passthrough(true),
                            prev_flux(0.0f),
                            transient_threshold(16.0f),
                            prof_sum(0), prof_peak(0), prof_count(0),
@@ -195,6 +196,9 @@ private:
     // Pitch shifting
     float pitch_ratio;    // 1.0 = no shift, 2.0 = octave up, 0.5 = octave down
     float pitch_semitones;
+
+    // Tracks whether last frame was passthrough so PV state can be flushed on re-entry.
+    bool was_passthrough;
 
     // Transient detection (spectral flux)
     float prev_flux;

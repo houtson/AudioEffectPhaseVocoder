@@ -8,7 +8,7 @@ This fork adds **time-stretching** — playing audio at variable speed without c
 
 **Target hardware:** Teensy 4.0 / 4.1 + Audio Shield (SGTL5000). Requires Teensy 4 due to the CMSIS 5 FFT API (`arm_cfft_f32`).
 
-## API
+## API 
 
 ```cpp
 AudioEffectPhaseVocoder vocoder;
@@ -61,6 +61,8 @@ if (vocoder.getProfiling(meanUs, peakUs)) { ... }
 | u     | Transient threshold: 16 (subtle)    |
 | d     | Toggle profiling report             |
 | h     | Help                                |
+
+3 test wav files are included in the test directory - copy them to a sd card
 
 ## Memory
 
