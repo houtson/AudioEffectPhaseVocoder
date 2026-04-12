@@ -59,6 +59,8 @@ public:
                            looping(false),
                            stretch_factor(1.0f),
                            analysis_hop((float)SYNTH_HOP),
+                           pitch_ratio(1.0f),
+                           pitch_semitones(0.0f),
                            prev_flux(0.0f),
                            transient_threshold(16.0f),
                            prof_sum(0), prof_peak(0), prof_count(0),
@@ -169,8 +171,12 @@ public:
         return true;
     }
 
-    // Stub — pitch shifting not yet implemented
-    void setPitchShift(float semitones) { (void)semitones; }
+    // Pitch shift in semitones. 0 = no shift, +12 = one octave up, -12 = one octave down.
+    void setPitchShift(float semitones) {
+        pitch_semitones = semitones;
+        pitch_ratio = powf(2.0f, semitones / 12.0f);
+    }
+    float getPitchShift() const { return pitch_semitones; }
 
     virtual void update(void);
 
@@ -185,6 +191,10 @@ private:
     // Stretch control (analysis_hop read from ISR, written from main thread)
     volatile float stretch_factor;
     volatile float analysis_hop;
+
+    // Pitch shifting
+    float pitch_ratio;    // 1.0 = no shift, 2.0 = octave up, 0.5 = octave down
+    float pitch_semitones;
 
     // Transient detection (spectral flux)
     float prev_flux;

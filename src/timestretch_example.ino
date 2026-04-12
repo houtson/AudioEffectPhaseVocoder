@@ -45,6 +45,7 @@ static const float CONTROL_STEP = 0.01f;
 static const bool  USE_POT      = false;
 
 float stretch   = 1.0f;
+float pitchSt   = 0.0f;   // pitch shift in semitones
 bool  profiling = false;
 
 // ---------------------------------------------------------------------------
@@ -80,6 +81,9 @@ static void printHelp() {
     Serial.println("  p      faster");
     Serial.println("  q      slower");
     Serial.println("  1-3    load 01.WAV / 02.WAV / 03.WAV");
+    Serial.println("  w      pitch up 1 semitone");
+    Serial.println("  x      pitch down 1 semitone");
+    Serial.println("  z      reset pitch to 0");
     Serial.println("  t      transient threshold: 4  (sensitive)");
     Serial.println("  y      transient threshold: 8  (default)");
     Serial.println("  u      transient threshold: 16 (subtle)");
@@ -175,6 +179,9 @@ void loop() {
         else if (key == 'p')                applyStretch(stretch - CONTROL_STEP);  // faster
         else if (key == 'q')                applyStretch(stretch + CONTROL_STEP);  // slower
         else if (key >= '1' && key <= '3')  loadAndPlay(key - '1');
+        else if (key == 'w')                { pitchSt += 1.0f; vocoder.setPitchShift(pitchSt); Serial.print("Pitch: "); Serial.print(pitchSt, 0); Serial.println(" st"); }
+        else if (key == 'x')                { pitchSt -= 1.0f; vocoder.setPitchShift(pitchSt); Serial.print("Pitch: "); Serial.print(pitchSt, 0); Serial.println(" st"); }
+        else if (key == 'z')                { pitchSt = 0.0f;  vocoder.setPitchShift(pitchSt); Serial.println("Pitch: 0 st"); }
         else if (key == 't')                { vocoder.setTransientThreshold(4.0f);  Serial.println("Transient threshold: 4"); }
         else if (key == 'y')                { vocoder.setTransientThreshold(8.0f);  Serial.println("Transient threshold: 8"); }
         else if (key == 'u')                { vocoder.setTransientThreshold(16.0f); Serial.println("Transient threshold: 16"); }

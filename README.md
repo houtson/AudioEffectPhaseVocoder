@@ -29,6 +29,11 @@ vocoder.setStretch(1.5f);
 float s = vocoder.getStretch();
 
 
+// Pitch shifting (semitones). 0 = no shift, +12 = octave up, -12 = octave down.
+// Independent of time-stretching — both can be applied simultaneously.
+vocoder.setPitchShift(3.0f);   // up 3 semitones
+float p = vocoder.getPitchShift();
+
 // Transient detection sensitivity (default 16.0)
 // Lower = more phase resets on attacks → better transient preservation
 // Higher = fewer resets → smoother sustain
@@ -48,6 +53,9 @@ if (vocoder.getProfiling(meanUs, peakUs)) { ... }
 | p     | Faster                              |
 | q     | Slower                              |
 | 1-3   | Load 01.WAV / 02.WAV / 03.WAV      |
+| w     | Pitch up 1 semitone                 |
+| x     | Pitch down 1 semitone               |
+| z     | Reset pitch to 0                    |
 | t     | Transient threshold: 4 (sensitive)  |
 | y     | Transient threshold: 8 (default)    |
 | u     | Transient threshold: 16 (subtle)    |

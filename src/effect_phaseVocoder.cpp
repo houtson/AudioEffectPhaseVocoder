@@ -124,18 +124,51 @@ void AudioEffectPhaseVocoder::update(void) {
         bool is_transient = (flux > prev_flux * transient_threshold);
         prev_flux = 0.8f * prev_flux + 0.2f * flux;
 
-        // --- Phase synthesis: accumulate output phase at fixed synthesis hop ---
-        for (int k = 0; k < HALF_FFT_SIZE; k++) {
-            if (is_transient) {
-                Phase_Sum[k] = atan2f(FFT_Split_Frame[2 * k + 1], FFT_Split_Frame[2 * k]);
-            } else {
-                Phase_Sum[k] += phase_step * Synth_Freq[k];
+        // --- Phase synthesis (with optional pitch shift) ---
+        //
+        // Pitch shifting must happen in the magnitude/frequency domain — before
+        // phase accumulation — so that Phase_Sum tracks the correct output frequency.
+        // Remapping after synthesis (in the complex domain) produces incoherent phases.
+        //
+        // FFT_Frame is free at this point and is split into two HALF_FFT_SIZE scratch arrays:
+        //   out_magn = FFT_Frame[0 .. HALF_FFT_SIZE-1]
+        //   out_freq = FFT_Frame[HALF_FFT_SIZE .. FFT_SIZE-1]
+        const float pr = pitch_ratio;
+        if (pr != 1.0f) {
+            float *out_magn = FFT_Frame;
+            float *out_freq = FFT_Frame + HALF_FFT_SIZE;
+            memset(FFT_Frame, 0, FFT_SIZE * sizeof(float));
+
+            for (int k = 0; k < HALF_FFT_SIZE; k++) {
+                int dk = (int)((float)k * pr);
+                if (dk >= HALF_FFT_SIZE) break;
+                out_magn[dk] += Synth_Magn[k];
+                out_freq[dk]  = Synth_Freq[k] * pr;  // true frequency scales with pitch ratio
             }
 
-            float sinVal, cosVal;
-            arm_sin_cos_f32(Phase_Sum[k] * (180.0f / M_PI), &sinVal, &cosVal);
-            FFT_Split_Frame[2 * k]     = Synth_Magn[k] * cosVal;
-            FFT_Split_Frame[2 * k + 1] = Synth_Magn[k] * sinVal;
+            for (int k = 0; k < HALF_FFT_SIZE; k++) {
+                if (is_transient) {
+                    Phase_Sum[k] = atan2f(FFT_Split_Frame[2 * k + 1], FFT_Split_Frame[2 * k]);
+                } else {
+                    Phase_Sum[k] += phase_step * out_freq[k];
+                }
+                float sinVal, cosVal;
+                arm_sin_cos_f32(Phase_Sum[k] * (180.0f / M_PI), &sinVal, &cosVal);
+                FFT_Split_Frame[2 * k]     = out_magn[k] * cosVal;
+                FFT_Split_Frame[2 * k + 1] = out_magn[k] * sinVal;
+            }
+        } else {
+            for (int k = 0; k < HALF_FFT_SIZE; k++) {
+                if (is_transient) {
+                    Phase_Sum[k] = atan2f(FFT_Split_Frame[2 * k + 1], FFT_Split_Frame[2 * k]);
+                } else {
+                    Phase_Sum[k] += phase_step * Synth_Freq[k];
+                }
+                float sinVal, cosVal;
+                arm_sin_cos_f32(Phase_Sum[k] * (180.0f / M_PI), &sinVal, &cosVal);
+                FFT_Split_Frame[2 * k]     = Synth_Magn[k] * cosVal;
+                FFT_Split_Frame[2 * k + 1] = Synth_Magn[k] * sinVal;
+            }
         }
 
         prof_t_synthesis += (uint32_t)sectionTimer; sectionTimer = 0;
