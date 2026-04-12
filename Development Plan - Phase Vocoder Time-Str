@@ -1,0 +1,144 @@
+Development Plan: Phase Vocoder Time-Stretching
+The core algorithmic change
+Time-stretching requires decoupling the analysis hop from the synthesis hop:
+
+Analysis hop = how many samples we consume from the input buffer per frame → controls how fast we read the sample
+Synthesis hop = how many samples we output per frame → stays fixed at AUDIO_BLOCK_SAMPLES (128) to satisfy Teensy's block rate
+
+stretch_factor = synthesis_hop / analysis_hop
+
+stretch > 1  →  analysis_hop < 128  →  reads input slowly  →  output is longer (slower)
+stretch < 1  →  analysis_hop > 128  →  reads input fast    →  output is shorter (faster)
+The phase accumulation must use synthesis_hop (what drives the output), while the phase analysis uses analysis_hop (what determines the true instantaneous frequency). Currently the code conflates these — both use STEP_SIZE.
+
+Phase 1 — Fix existing bugs and clean up
+1.1 Fix the broken #include
+
+effect_phaseVocoder.cpp:26 includes "effect_vocoder.h" — should be "effect_phaseVocoder.h". The existing examples also include the wrong header.
+
+1.2 Replace hardcoded magic numbers with symbolic expressions
+
+The current phase calculation buries these constants:
+
+0.07957747154594767 = 1/(4π) — used in phase unwrapping
+433096375.5250785 and 137858858 — encoded from AUDIO_SAMPLE_RATE_EXACT, FFT_SIZE, STEP_SIZE
+These will break when hop sizes change for time-stretching. Replace with expressions derived from actual constants so they update correctly.
+
+1.3 Strip the experimental pitch-shift code
+
+The max_magn_index peak-picking logic (lines 84–106, 157–186 of the cpp) is incomplete and commented out in parts. For time-stretching it is irrelevant and obscures the core algorithm. Remove it entirely. Keep setPitchShift() as a potential future addition but make it a no-op for now.
+
+1.4 Verify clean passthrough (stretch = 1.0)
+
+With the above fixed, confirm the effect plays back a stored sample transparently without pitch or timing artifacts.
+
+Phase 2 — Internalize sample playback
+Currently the effect is a 1-in/1-out AudioStream node fed by AudioPlayMemory. For time-stretching, the effect must own the read pointer into the sample buffer so it can advance it at a variable rate.
+
+2.1 Change to a 0-input, 1-output audio object
+
+Remove receiveReadOnly(). Change the AudioStream constructor to declare 0 inputs:
+
+
+AudioEffectPhaseVocoder() : AudioStream(0, nullptr), ...
+2.2 Add sample buffer API
+
+
+void setSample(const int16_t *data, uint32_t numSamples);
+void play();
+void stop();
+void setLoop(bool loop);
+bool isPlaying();
+Store the pointer, length, and a float read_pos (fractional read position).
+
+2.3 Replace blocklist with direct reads from the sample buffer
+
+Instead of collecting audio_block_t blocks from the audio graph, read directly from the sample buffer into FFT_Frame when processing. Use linear interpolation on fractional read positions:
+
+
+float s0 = sample_data[(int)read_pos];
+float s1 = sample_data[(int)read_pos + 1];
+float frac = read_pos - (int)read_pos;
+FFT_Frame[i] = s0 + frac * (s1 - s0);
+Advance read_pos by analysis_hop per frame (Phase 3 will make this variable).
+
+2.4 Remove the 8-block state machine
+
+The blocklist/state machine was necessary because audio arrived one block at a time from the stream. Now that we own the buffer, we can fill FFT_Frame in one shot every update. The sliding window becomes a simple read_pos advance.
+
+Phase 3 — Implement time-stretching
+3.1 Add stretch factor control
+
+
+void setStretch(float factor);  // 0.5 = half duration, 2.0 = double duration
+Store as float stretch_factor. Compute:
+
+
+float analysis_hop = AUDIO_BLOCK_SAMPLES / stretch_factor;  // can be fractional
+3.2 Update the phase analysis formula
+
+The true instantaneous frequency of bin k is:
+
+
+expected_delta = 2π × k × analysis_hop / FFT_SIZE
+deviation      = (phase[k] - last_phase[k] - expected_delta)  [wrapped to -π..π]
+true_omega[k]  = 2π × k / FFT_SIZE  +  deviation / analysis_hop
+true_omega[k] is in radians/sample and is independent of hop size — it is the actual frequency present in the signal.
+
+3.3 Accumulate phase at synthesis rate
+
+
+Phase_Sum[k] += true_omega[k] × AUDIO_BLOCK_SAMPLES
+Using fixed AUDIO_BLOCK_SAMPLES (128) as the synthesis hop keeps the output locked to Teensy's block clock regardless of stretch.
+
+3.4 Advance read position by analysis_hop each frame
+
+
+read_pos += analysis_hop;
+if (read_pos >= sample_length) {
+    if (looping) read_pos = fmodf(read_pos, sample_length);
+    else { playing = false; return; }
+}
+Because analysis_hop can be fractional, wrap with fmodf not integer arithmetic.
+
+Phase 4 — Quality improvements for drum beats
+4.1 Increase FFT overlap for better transient resolution
+
+Drums have sharp transients. OVER_SAMPLE=8 (hop=128) is reasonable but the current code only processes one FFT per update(). Confirm this is truly sliding every 128 samples — if not, increase overlap.
+
+4.2 Phase-locked vocoder for transients (optional, significant improvement)
+
+Standard phase vocoders smear transients ("phasiness"). The fix: detect transient frames (large energy increase between frames) and reset Phase_Sum to the analysis phase instead of accumulating. This is the single biggest quality improvement for drum material.
+
+Detection:
+
+
+float energy = /* sum of Synth_Magn[k] */;
+if (energy > prev_energy * transient_threshold) {
+    // reset: Phase_Sum[k] = analysis_phase[k]
+}
+4.3 Anti-aliasing for fast compression (stretch < 1)
+
+When analysis_hop > AUDIO_BLOCK_SAMPLES (compression), you're skipping samples. Apply a simple low-pass (or use the FFT magnitude rolloff naturally) to avoid aliasing.
+
+Summary of what changes vs what stays
+Component	Action
+FFT/IFFT infrastructure	Keep — it works
+Window function	Keep
+arm_cfft_f32, split_rfft_f32	Keep
+atan2_fast	Keep
+State machine / blocklist	Remove
+receiveReadOnly()	Remove
+Peak-picking / max_magn_index logic	Remove
+Hardcoded magic number phase calc	Replace with symbolic
+setPitchShift()	Keep as stub, separate from stretch
+Sample buffer + fractional read pointer	Add
+Variable analysis_hop	Add
+Synthesis phase accumulation fix	Add
+Transient detection	Add (Phase 4)
+Suggested implementation order
+Phase 1 (cleanup) — gets a buildable baseline
+Phase 2 (sample internalization) — gets audio playing back at 1:1
+Phase 3 (stretch) — the core feature
+Phase 4 (transient handling) — makes it sound good on drums
+Want me to start implementing Phase 1?
