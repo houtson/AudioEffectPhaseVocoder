@@ -35,24 +35,41 @@ void AudioEffectPhaseVocoder::update(void) {
         audio_block_t *passBlock = allocate();
         if (passBlock) {
             for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++) {
-                float pos = read_pos + (float)i;
-                if (looping && pos >= (float)sample_length)
-                    pos = fmodf(pos, (float)sample_length);
-                uint32_t idx  = (uint32_t)pos;
-                float    frac = pos - (float)idx;
-                uint32_t idx1 = (looping && idx + 1 >= sample_length) ? 0 : idx + 1;
-                float s0 = (idx  < sample_length) ? sample_data[idx]  * (1.0f / 32768.0f) : 0.0f;
-                float s1 = (idx1 < sample_length) ? sample_data[idx1] * (1.0f / 32768.0f) : 0.0f;
-                int32_t out = (int32_t)((s0 + frac * (s1 - s0)) * 32768.0f);
-                passBlock->data[i] = (int16_t)__SSAT(out, 16);
+                float pos = reverse
+                    ? read_pos - (float)(AUDIO_BLOCK_SAMPLES - 1 - i)
+                    : read_pos + (float)i;
+                if (looping) {
+                    if (pos < 0.0f)                  pos += (float)sample_length;
+                    else if (pos >= (float)sample_length) pos = fmodf(pos, (float)sample_length);
+                }
+                float s0 = 0.0f, s1 = 0.0f;
+                if (pos >= 0.0f) {
+                    uint32_t idx  = (uint32_t)pos;
+                    float    frac = pos - (float)idx;
+                    uint32_t idx1 = (looping && idx + 1 >= sample_length) ? 0 : idx + 1;
+                    s0 = (idx  < sample_length) ? sample_data[idx]  * (1.0f / 32768.0f) : 0.0f;
+                    s1 = (idx1 < sample_length) ? sample_data[idx1] * (1.0f / 32768.0f) : 0.0f;
+                    int32_t out = (int32_t)((s0 + frac * (s1 - s0)) * 32768.0f);
+                    passBlock->data[i] = (int16_t)__SSAT(out, 16);
+                } else {
+                    passBlock->data[i] = 0;
+                }
             }
             transmit(passBlock);
             release(passBlock);
         }
-        read_pos += (float)AUDIO_BLOCK_SAMPLES;
-        if (read_pos >= (float)sample_length) {
-            if (looping) read_pos = fmodf(read_pos, (float)sample_length);
-            else         playing = false;
+        if (reverse) {
+            read_pos -= (float)AUDIO_BLOCK_SAMPLES;
+            if (read_pos < 0.0f) {
+                if (looping) read_pos += (float)sample_length;
+                else         playing = false;
+            }
+        } else {
+            read_pos += (float)AUDIO_BLOCK_SAMPLES;
+            if (read_pos >= (float)sample_length) {
+                if (looping) read_pos = fmodf(read_pos, (float)sample_length);
+                else         playing = false;
+            }
         }
         was_passthrough = true;
         return;
@@ -97,9 +114,22 @@ void AudioEffectPhaseVocoder::update(void) {
         memmove(input_window, input_window + slide, (FFT_SIZE - slide) * sizeof(float));
 
         for (int i = 0; i < slide; i++) {
-            float pos = read_pos + (float)i;
-            if (looping && pos >= (float)sample_length)
-                pos = fmodf(pos, (float)sample_length);
+            // Forward: newest sample at read_pos+slide-1 → tail of window.
+            // Reverse: newest sample at read_pos (highest index in buffer) → tail of window,
+            //          oldest new sample at read_pos-(slide-1) → head of new region.
+            float pos = reverse
+                ? (read_pos - (float)(slide - 1 - i))
+                : (read_pos + (float)i);
+
+            if (looping) {
+                if (pos < 0.0f)                      pos += (float)sample_length;
+                else if (pos >= (float)sample_length) pos  = fmodf(pos, (float)sample_length);
+            }
+
+            if (pos < 0.0f) {
+                input_window[FFT_SIZE - slide + i] = 0.0f;
+                continue;
+            }
 
             uint32_t idx  = (uint32_t)pos;
             float    frac = pos - (float)idx;
@@ -110,10 +140,18 @@ void AudioEffectPhaseVocoder::update(void) {
             input_window[FFT_SIZE - slide + i] = s0 + frac * (s1 - s0);
         }
 
-        read_pos += hop;
-        if (read_pos >= (float)sample_length) {
-            if (looping) read_pos = fmodf(read_pos, (float)sample_length);
-            else         playing = false;
+        if (reverse) {
+            read_pos -= hop;
+            if (read_pos < 0.0f) {
+                if (looping) read_pos += (float)sample_length;
+                else         playing = false;
+            }
+        } else {
+            read_pos += hop;
+            if (read_pos >= (float)sample_length) {
+                if (looping) read_pos = fmodf(read_pos, (float)sample_length);
+                else         playing = false;
+            }
         }
 
         prof_t_window += (uint32_t)sectionTimer; sectionTimer = 0;

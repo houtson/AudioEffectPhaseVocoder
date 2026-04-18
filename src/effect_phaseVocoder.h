@@ -61,6 +61,7 @@ public:
                            analysis_hop((float)SYNTH_HOP),
                            pitch_ratio(1.0f),
                            pitch_semitones(0.0f),
+                           reverse(false),
                            was_passthrough(true),
                            prev_flux(0.0f),
                            transient_threshold(16.0f),
@@ -112,10 +113,13 @@ public:
     float getStretch()             const { return stretch_factor; }
     float getTransientThreshold()  const { return transient_threshold; }
 
+    void setReverse(bool r) { reverse = r; }
+    bool isReverse()        { return reverse; }
+
     void play() {
         if (!sample_data) return;
         AudioNoInterrupts();
-        read_pos      = 0.0f;
+        read_pos      = reverse ? (float)(sample_length - 1) : 0.0f;
         prev_flux     = 0.0f;
         memset(input_window, 0, FFT_SIZE * sizeof(float));
         memset(Last_Phase,   0, FFT_SIZE * sizeof(float));
@@ -196,6 +200,8 @@ private:
     // Pitch shifting
     float pitch_ratio;    // 1.0 = no shift, 2.0 = octave up, 0.5 = octave down
     float pitch_semitones;
+
+    bool  reverse;
 
     // Tracks whether last frame was passthrough so PV state can be flushed on re-entry.
     bool was_passthrough;

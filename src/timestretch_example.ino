@@ -81,6 +81,7 @@ static void printHelp() {
     Serial.println("  p      faster");
     Serial.println("  q      slower");
     Serial.println("  1-3    load 01.WAV / 02.WAV / 03.WAV");
+    Serial.println("  r      toggle reverse playback");
     Serial.println("  w      pitch up 1 semitone");
     Serial.println("  x      pitch down 1 semitone");
     Serial.println("  z      reset pitch to 0");
@@ -179,6 +180,7 @@ void loop() {
         else if (key == 'p')                applyStretch(stretch - CONTROL_STEP);  // faster
         else if (key == 'q')                applyStretch(stretch + CONTROL_STEP);  // slower
         else if (key >= '1' && key <= '3')  loadAndPlay(key - '1');
+        else if (key == 'r')                { bool rv = !vocoder.isReverse(); vocoder.setReverse(rv); vocoder.play(); Serial.println(rv ? "Reverse: on" : "Reverse: off"); }
         else if (key == 'w')                { pitchSt += 1.0f; vocoder.setPitchShift(pitchSt); Serial.print("Pitch: "); Serial.print(pitchSt, 0); Serial.println(" st"); }
         else if (key == 'x')                { pitchSt -= 1.0f; vocoder.setPitchShift(pitchSt); Serial.print("Pitch: "); Serial.print(pitchSt, 0); Serial.println(" st"); }
         else if (key == 'z')                { pitchSt = 0.0f;  vocoder.setPitchShift(pitchSt); Serial.println("Pitch: 0 st"); }
@@ -220,4 +222,34 @@ void loop() {
         int raw = analogRead(POT_PIN);
         applyStretch(STRETCH_MIN + (raw / 1023.0f) * (STRETCH_MAX - STRETCH_MIN));
     }
+}
+
+
+
+            void RAM_LOAD ()  {         
+              
+  int SMP_FILE_NUM=0;
+  for (int i = 0; i < NUM_WAVS; i++) {
+                              x_File = SD.open(SMP_WAV[i], FILE_READ);
+                             if (x_File)
+                                         {
+      sizes[i] = x_File.size();
+      SMP_addr[i] = (int16_t*) extmem_malloc(sizes[i]);
+      if (nullptr == SMP_addr[i])
+        Serial.printf("Failed to allocate %d in EXTMEM for %s\n", sizes[i], SMP_WAV[i]);
+      else     {
+        if (sizes[i] != x_File.read(SMP_addr[i], sizes[i]))     
+        {
+          Serial.printf("Failed to read in %s - wrong length\n", SMP_WAV[i]);
+          extmem_free(SMP_addr[i]); // free memory
+          SMP_addr[i] = nullptr;    // mark as "not loaded"
+        }
+        else
+          Serial.printf("Read %s into memory at %08X; %d bytes\n", SMP_WAV[i], SMP_addr[i], sizes[i]);
+      }
+      x_File.close();
+    }
+    else
+      Serial.printf("Failed to open %s\n", SMP_WAV[i]);
+  }
 }
