@@ -84,6 +84,14 @@ struct VoiceState
 };
 VoiceState voices[NUM_VOICES];
 
+struct PendingTrigger
+{
+    int vi = -1;    // voice index to trigger after fade-out completes
+    int si = -1;    // sample index to trigger
+    uint32_t readyAt = 0;
+};
+static PendingTrigger pending;
+
 int lastSelected = 0; // most recently triggered sample
 
 bool profiling = false;
@@ -106,26 +114,20 @@ static void applySettings(int vi, int si)
     voice[vi]->setLoop(s.loop);
 }
 
-// AudioEffectFade runs the ramp in the audio ISR — no per-step delays needed.
-// One delay() waits for the fade to finish before the voice is reassigned.
-static const int FADE_OUT_MS = 20;
+static const int FADE_OUT_MS = 5;
 static const int FADE_IN_MS = 10;
 
-static void fadeOutVoice(int vi)
-{
-    fader[vi]->fadeOut(FADE_OUT_MS);
-    delay(FADE_OUT_MS + 3);
-    voice[vi]->stop();
-}
-
-// Returns a voice index ready to use.  Fades out and reclaims the oldest
-// active voice if all slots are occupied.
-static int allocVoice()
+// Returns a free voice index, or steals the oldest and starts a non-blocking
+// fade-out, storing the trigger in `pending` for loop() to fire after the fade.
+static int allocVoice(bool &stolen)
 {
     for (int i = 0; i < NUM_VOICES; i++)
     {
         if (voices[i].sample == -1)
+        {
+            stolen = false;
             return i;
+        }
     }
     int oldest = 0;
     uint32_t age = voices[0].startTime;
@@ -137,8 +139,9 @@ static int allocVoice()
             oldest = i;
         }
     }
-    fadeOutVoice(oldest);
+    fader[oldest]->fadeOut(FADE_OUT_MS);
     voices[oldest].sample = -1;
+    stolen = true;
     return oldest;
 }
 
@@ -162,8 +165,16 @@ static void triggerSample(int si)
     }
 
     lastSelected = si;
-    int vi = allocVoice();
+    bool stolen;
+    int vi = allocVoice(stolen);
 
+    if (stolen)
+    {
+        pending = {vi, si, millis() + FADE_OUT_MS};
+        return;
+    }
+
+    voice[vi]->stop();
     voice[vi]->setSample(sampleData[si], sampleFrames[si]);
     applySettings(vi, si);
     voice[vi]->play();
@@ -323,6 +334,23 @@ void loop()
         {
             voices[vi].sample = -1;
         }
+    }
+
+    // fire pending trigger once fade-out has completed
+    if (pending.vi != -1 && millis() >= pending.readyAt)
+    {
+        int vi = pending.vi, si = pending.si;
+        pending.vi = -1;
+        voice[vi]->stop();
+        voice[vi]->setSample(sampleData[si], sampleFrames[si]);
+        applySettings(vi, si);
+        voice[vi]->play();
+        fader[vi]->fadeIn(FADE_IN_MS);
+        voices[vi].sample = si;
+        voices[vi].startTime = millis();
+        Serial.printf("Voice %d -> sample %d  x%.2f  pitch=%.0fst  rev=%s  loop=%s\n",
+                      vi, si + 1, 1.0f / settings[si].stretch, settings[si].pitch_st,
+                      settings[si].reverse ? "Y" : "N", settings[si].loop ? "Y" : "N");
     }
 
     if (profiling && millis() - lastProf >= 2000)
