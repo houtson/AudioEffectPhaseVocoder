@@ -223,33 +223,3 @@ void loop() {
         applyStretch(STRETCH_MIN + (raw / 1023.0f) * (STRETCH_MAX - STRETCH_MIN));
     }
 }
-
-
-
-            void RAM_LOAD ()  {         
-              
-  int SMP_FILE_NUM=0;
-  for (int i = 0; i < NUM_WAVS; i++) {
-                              x_File = SD.open(SMP_WAV[i], FILE_READ);
-                             if (x_File)
-                                         {
-      sizes[i] = x_File.size();
-      SMP_addr[i] = (int16_t*) extmem_malloc(sizes[i]);
-      if (nullptr == SMP_addr[i])
-        Serial.printf("Failed to allocate %d in EXTMEM for %s\n", sizes[i], SMP_WAV[i]);
-      else     {
-        if (sizes[i] != x_File.read(SMP_addr[i], sizes[i]))     
-        {
-          Serial.printf("Failed to read in %s - wrong length\n", SMP_WAV[i]);
-          extmem_free(SMP_addr[i]); // free memory
-          SMP_addr[i] = nullptr;    // mark as "not loaded"
-        }
-        else
-          Serial.printf("Read %s into memory at %08X; %d bytes\n", SMP_WAV[i], SMP_addr[i], sizes[i]);
-      }
-      x_File.close();
-    }
-    else
-      Serial.printf("Failed to open %s\n", SMP_WAV[i]);
-  }
-}
