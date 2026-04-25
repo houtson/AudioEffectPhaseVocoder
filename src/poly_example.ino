@@ -75,9 +75,6 @@ static const char *sampleFiles[NUM_SAMPLES] = {
 int16_t *sampleData[NUM_SAMPLES] = {};
 uint32_t sampleFrames[NUM_SAMPLES] = {};
 
-// Staging buffer: SD reads here first, then memcpy to EXTMEM.
-// Avoids stalling SD DMA when writing directly to PSRAM.
-DMAMEM static uint8_t stageBuf[8192];
 
 // Voice tracking
 struct VoiceState
@@ -180,7 +177,7 @@ static void triggerSample(int si)
                   settings[si].reverse ? "Y" : "N", settings[si].loop ? "Y" : "N");
 }
 
-// Staged SD→PSRAM loader 16-bit PCM WAV @ 44100 Hz.
+// SD→PSRAM loader, supports 8/16/24-bit mono or stereo WAV @ 44100 Hz.
 static bool loadSample(int si)
 {
     const char *filename = sampleFiles[si];
@@ -191,19 +188,16 @@ static bool loadSample(int si)
         Serial.println(filename);
         return false;
     }
-
     // Read fmt fields: channels (offset 22), bits-per-sample (offset 34)
     f.seek(22);
     int chanLo = f.read(), chanHi = f.read();
     if (chanLo < 0 || chanHi < 0) { f.close(); return false; }
     const uint16_t numCh = (uint16_t)((chanHi << 8) | chanLo);
-
     f.seek(34);
     int bpsLo = f.read(), bpsHi = f.read();
     if (bpsLo < 0 || bpsHi < 0) { f.close(); return false; }
     const uint16_t bitsPerSample = (uint16_t)((bpsHi << 8) | bpsLo);
     const uint32_t bytesPerSample = (bitsPerSample + 7u) / 8u;
-
     // Scan for "data" chunk — header may have extra chunks (LIST, JUNK, etc.)
     f.seek(12);
     uint32_t dataBytes = 0;
@@ -232,14 +226,12 @@ static bool loadSample(int si)
     }
     const uint32_t frameStride = bytesPerSample * numCh;
     uint32_t frameCount = dataBytes / frameStride;
-
     if (sampleData[si])
     {
         extmem_free(sampleData[si]);
         sampleData[si] = nullptr;
         sampleFrames[si] = 0;
     }
-
     sampleData[si] = (int16_t *)extmem_malloc(frameCount * sizeof(int16_t));
     if (!sampleData[si])
     {
@@ -248,34 +240,21 @@ static bool loadSample(int si)
         f.close();
         return false;
     }
-
+    uint8_t frameBuf[6]; // max frameStride: stereo 24-bit = 6 bytes
     uint32_t written = 0;
-    uint32_t chunkBytes = sizeof(stageBuf) - (sizeof(stageBuf) % frameStride);
-
-    while (written < frameCount && f.available())
+    while (written < frameCount && f.read(frameBuf, frameStride) == frameStride)
     {
-        uint32_t need = min((uint32_t)(frameCount - written) * frameStride, chunkBytes);
-        uint32_t got = f.read(stageBuf, need);
-        if (got == 0)
-            break;
-
-        uint32_t frames = got / frameStride;
-        for (uint32_t i = 0; i < frames && written < frameCount; i++)
-        {
-            uint32_t base = i * frameStride;
-            int16_t sample;
-            if (bytesPerSample == 1)
-                sample = (int16_t)(((uint16_t)stageBuf[base] - 128u) << 8); // 8-bit unsigned → 16-bit signed
-            else if (bytesPerSample == 2)
-                sample = (int16_t)(((uint16_t)stageBuf[base + 1] << 8) | stageBuf[base]);
-            else // 24-bit: take top 2 bytes
-                sample = (int16_t)(((uint16_t)stageBuf[base + 2] << 8) | stageBuf[base + 1]);
-            sampleData[si][written++] = sample;
-        }
+        int16_t sample;
+        if (bytesPerSample == 1)
+            sample = (int16_t)(((uint16_t)frameBuf[0] - 128u) << 8);
+        else if (bytesPerSample == 2)
+            sample = (int16_t)(((uint16_t)frameBuf[1] << 8) | frameBuf[0]);
+        else
+            sample = (int16_t)(((uint16_t)frameBuf[2] << 8) | frameBuf[1]);
+        sampleData[si][written++] = sample;
     }
     f.close();
     sampleFrames[si] = written;
-
     Serial.printf("Loaded %s  %lu frames  ch=%u  %ubit  %.1fs\n",
                   filename, written, numCh, bitsPerSample, written / (float)AUDIO_SAMPLE_RATE_EXACT);
     return written > 0;
