@@ -192,22 +192,46 @@ static bool loadSample(int si)
         return false;
     }
 
-    // Channel count at header offset 22
+    // Read fmt fields: channels (offset 22), bits-per-sample (offset 34)
     f.seek(22);
     int chanLo = f.read(), chanHi = f.read();
-    if (chanLo < 0 || chanHi < 0)
+    if (chanLo < 0 || chanHi < 0) { f.close(); return false; }
+    const uint16_t numCh = (uint16_t)((chanHi << 8) | chanLo);
+
+    f.seek(34);
+    int bpsLo = f.read(), bpsHi = f.read();
+    if (bpsLo < 0 || bpsHi < 0) { f.close(); return false; }
+    const uint16_t bitsPerSample = (uint16_t)((bpsHi << 8) | bpsLo);
+    const uint32_t bytesPerSample = (bitsPerSample + 7u) / 8u;
+
+    // Scan for "data" chunk — header may have extra chunks (LIST, JUNK, etc.)
+    f.seek(12);
+    uint32_t dataBytes = 0;
+    bool foundData = false;
+    uint8_t szBuf[4];
+    char id[4];
+    while (f.available() >= 8)
     {
+        f.read(id, 4);
+        f.read(szBuf, 4);
+        uint32_t chunkSize = (uint32_t)szBuf[0] | ((uint32_t)szBuf[1] << 8) | ((uint32_t)szBuf[2] << 16) | ((uint32_t)szBuf[3] << 24);
+        if (id[0]=='d' && id[1]=='a' && id[2]=='t' && id[3]=='a')
+        {
+            dataBytes = chunkSize;
+            foundData = true;
+            break;
+        }
+        f.seek(f.position() + chunkSize + (chunkSize & 1));
+    }
+    if (!foundData)
+    {
+        Serial.print("No data chunk: ");
+        Serial.println(filename);
         f.close();
         return false;
     }
-    const uint16_t numCh = (uint16_t)((chanHi << 8) | chanLo);
-
-    // PCM data chunk size at header offset 40
-    f.seek(40);
-    uint8_t szBuf[4];
-    f.read(szBuf, 4);
-    uint32_t dataBytes = (uint32_t)szBuf[0] | ((uint32_t)szBuf[1] << 8) | ((uint32_t)szBuf[2] << 16) | ((uint32_t)szBuf[3] << 24);
-    uint32_t frameCount = dataBytes / (2u * numCh);
+    const uint32_t frameStride = bytesPerSample * numCh;
+    uint32_t frameCount = dataBytes / frameStride;
 
     if (sampleData[si])
     {
@@ -225,30 +249,35 @@ static bool loadSample(int si)
         return false;
     }
 
-    f.seek(44);
     uint32_t written = 0;
-    uint32_t chunkBytes = sizeof(stageBuf) - (sizeof(stageBuf) % (2u * numCh));
+    uint32_t chunkBytes = sizeof(stageBuf) - (sizeof(stageBuf) % frameStride);
 
     while (written < frameCount && f.available())
     {
-        uint32_t need = min((uint32_t)(frameCount - written) * 2u * numCh, chunkBytes);
+        uint32_t need = min((uint32_t)(frameCount - written) * frameStride, chunkBytes);
         uint32_t got = f.read(stageBuf, need);
         if (got == 0)
             break;
 
-        uint32_t frames = got / (2u * numCh);
+        uint32_t frames = got / frameStride;
         for (uint32_t i = 0; i < frames && written < frameCount; i++)
         {
-            uint32_t base = i * 2u * numCh;
-            sampleData[si][written++] = (int16_t)(((uint16_t)stageBuf[base + 1] << 8) | stageBuf[base]);
-            // stereo: skip right-channel bytes (base+2, base+3) implicitly via stride
+            uint32_t base = i * frameStride;
+            int16_t sample;
+            if (bytesPerSample == 1)
+                sample = (int16_t)(((uint16_t)stageBuf[base] - 128u) << 8); // 8-bit unsigned → 16-bit signed
+            else if (bytesPerSample == 2)
+                sample = (int16_t)(((uint16_t)stageBuf[base + 1] << 8) | stageBuf[base]);
+            else // 24-bit: take top 2 bytes
+                sample = (int16_t)(((uint16_t)stageBuf[base + 2] << 8) | stageBuf[base + 1]);
+            sampleData[si][written++] = sample;
         }
     }
     f.close();
     sampleFrames[si] = written;
 
-    Serial.printf("Loaded %s  %lu frames  ch=%u  %.1fs\n",
-                  filename, written, numCh, written / (float)AUDIO_SAMPLE_RATE_EXACT);
+    Serial.printf("Loaded %s  %lu frames  ch=%u  %ubit  %.1fs\n",
+                  filename, written, numCh, bitsPerSample, written / (float)AUDIO_SAMPLE_RATE_EXACT);
     return written > 0;
 }
 
@@ -339,12 +368,14 @@ void loop()
     // Sample triggers
     if (key >= '1' && key <= '9')
     {
-        triggerSample(key - '1');
+        lastSelected = key - '1';
+        Serial.printf("Sample %d Selected, Hit SPACE to trigger\n", lastSelected +1);
         return;
     }
     if (key == '0')
     {
-        triggerSample(9);
+        lastSelected = 9;
+        Serial.print("Sample 0 Selected, Hit SPACE to trigger\n");
         return;
     }
 
@@ -371,57 +402,38 @@ void loop()
     case 'p':
         settings[si].stretch = clampf(settings[si].stretch - CONTROL_STEP, STRETCH_MIN, STRETCH_MAX);
         pushSettings(si);
-        Serial.print("Sample ");
-        Serial.print(si + 1);
-        Serial.print(" speed: ");
-        Serial.println(1.0f / settings[si].stretch, 2);
+        Serial.printf("Sample %d speed: %.2f\n", si + 1, 1.0f / settings[si].stretch);
         break;
     case 'q':
         settings[si].stretch = clampf(settings[si].stretch + CONTROL_STEP, STRETCH_MIN, STRETCH_MAX);
         pushSettings(si);
-        Serial.print("Sample ");
-        Serial.print(si + 1);
-        Serial.print(" speed: ");
-        Serial.println(1.0f / settings[si].stretch, 2);
+        Serial.printf("Sample %d speed: %.2f\n", si + 1, 1.0f / settings[si].stretch);
         break;
     case 'w':
         settings[si].pitch_st += 1.0f;
         pushSettings(si);
-        Serial.print("Sample ");
-        Serial.print(si + 1);
-        Serial.print(" pitch: ");
-        Serial.print(settings[si].pitch_st, 0);
-        Serial.println("st");
+        Serial.printf("Sample %d pitch: %.0fst\n", si + 1, settings[si].pitch_st);
         break;
     case 'x':
         settings[si].pitch_st -= 1.0f;
         pushSettings(si);
-        Serial.print("Sample ");
-        Serial.print(si + 1);
-        Serial.print(" pitch: ");
-        Serial.print(settings[si].pitch_st, 0);
-        Serial.println("st");
+        Serial.printf("Sample %d pitch: %.0fst\n", si + 1, settings[si].pitch_st);
         break;
     case 'z':
         settings[si].pitch_st = 0.0f;
+        settings[si].stretch = 1.0f;
         pushSettings(si);
-        Serial.print("Sample ");
-        Serial.print(si + 1);
-        Serial.println(" pitch: 0st");
+        Serial.printf("Sample %d speed: 1.0 pitch: 0st\n", si + 1);
         break;
     case 'r':
         settings[si].reverse = !settings[si].reverse;
         pushSettings(si);
-        Serial.print("Sample ");
-        Serial.print(si + 1);
-        Serial.println(settings[si].reverse ? " reverse: on" : " reverse: off");
+         Serial.printf("Sample %d reverse: %s\n", si + 1, settings[si].reverse ? "on" : "off");
         break;
     case 'l':
         settings[si].loop = !settings[si].loop;
         pushSettings(si);
-        Serial.print("Sample ");
-        Serial.print(si + 1);
-        Serial.println(settings[si].loop ? " loop: on" : " loop: off");
+         Serial.printf("Sample %d loop: %s\n", si + 1, settings[si].loop ? "on" : "off");
         break;
     case 't':
         for (int vi = 0; vi < NUM_VOICES; vi++)
